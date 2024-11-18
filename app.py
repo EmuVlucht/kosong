@@ -2,20 +2,25 @@ import os
 import random
 import requests
 from datetime import datetime
-from flask import Flask, request, jsonify, render_template
+from functools import wraps
+from urllib.parse import urlencode
+from flask import Flask, request, jsonify, render_template, redirect, url_for, session
 from flask_cors import CORS
-from models import db, TempEmail, EmailMessage
+from models import db, User, TempEmail, EmailMessage
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, supports_credentials=True)
 
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///tempmail.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('AUTH_DATABASE_URL', os.environ.get('DATABASE_URL', 'sqlite:///tempmail.db'))
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'pool_pre_ping': True,
     'pool_recycle': 300,
 }
 app.secret_key = os.environ.get('SECRET_KEY', 'tempmail-secret-key-2024')
+
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '')
+GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET', '')
 
 db.init_app(app)
 
@@ -40,9 +45,154 @@ def get_headers():
         "Accept-Language": "en-US,en;q=0.9",
     }
 
+def get_current_user():
+    user_id = session.get('user_id')
+    if user_id:
+        return User.query.get(user_id)
+    return None
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return jsonify({'success': False, 'error': 'Login diperlukan', 'require_login': True}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+def check_email_ownership(email_account, user):
+    if email_account.user_id is None:
+        return True
+    if user and email_account.user_id == user.id:
+        return True
+    return False
+
 @app.route('/')
 def index():
-    return render_template('index.html')
+    user = get_current_user()
+    return render_template('index.html', user=user)
+
+@app.route('/auth/login')
+def auth_login():
+    redirect_uri = request.host_url.rstrip('/') + '/auth/callback'
+    
+    state = os.urandom(16).hex()
+    session['oauth_state'] = state
+    
+    params = {
+        'client_id': GOOGLE_CLIENT_ID,
+        'redirect_uri': redirect_uri,
+        'response_type': 'code',
+        'scope': 'openid email profile',
+        'state': state,
+        'access_type': 'offline',
+        'prompt': 'consent'
+    }
+    
+    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
+    return redirect(auth_url)
+
+@app.route('/auth/callback')
+def auth_callback():
+    error = request.args.get('error')
+    if error:
+        return redirect('/?error=' + error)
+    
+    code = request.args.get('code')
+    state = request.args.get('state')
+    
+    if not code:
+        return redirect('/?error=no_code')
+    
+    if state != session.get('oauth_state'):
+        return redirect('/?error=invalid_state')
+    
+    redirect_uri = request.host_url.rstrip('/') + '/auth/callback'
+    
+    try:
+        token_response = requests.post(
+            'https://oauth2.googleapis.com/token',
+            data={
+                'code': code,
+                'client_id': GOOGLE_CLIENT_ID,
+                'client_secret': GOOGLE_CLIENT_SECRET,
+                'redirect_uri': redirect_uri,
+                'grant_type': 'authorization_code'
+            },
+            timeout=10
+        )
+        
+        if token_response.status_code != 200:
+            return redirect('/?error=token_failed')
+        
+        tokens = token_response.json()
+        access_token = tokens.get('access_token')
+        refresh_token = tokens.get('refresh_token')
+        
+        userinfo_response = requests.get(
+            'https://www.googleapis.com/oauth2/v2/userinfo',
+            headers={'Authorization': f'Bearer {access_token}'},
+            timeout=10
+        )
+        
+        if userinfo_response.status_code != 200:
+            return redirect('/?error=userinfo_failed')
+        
+        userinfo = userinfo_response.json()
+        google_id = userinfo.get('id')
+        email = userinfo.get('email')
+        name = userinfo.get('name')
+        picture = userinfo.get('picture')
+        
+        user = User.query.filter_by(google_id=google_id).first()
+        
+        if user:
+            user.access_token = access_token
+            if refresh_token:
+                user.refresh_token = refresh_token
+            user.last_login = datetime.utcnow()
+            user.name = name
+            user.picture = picture
+        else:
+            user = User(
+                google_id=google_id,
+                email=email,
+                name=name,
+                picture=picture,
+                access_token=access_token,
+                refresh_token=refresh_token
+            )
+            db.session.add(user)
+        
+        db.session.commit()
+        
+        session['user_id'] = user.id
+        session.pop('oauth_state', None)
+        
+        return redirect('/')
+        
+    except Exception as e:
+        print(f"OAuth Error: {str(e)}")
+        return redirect('/?error=auth_failed')
+
+@app.route('/auth/logout')
+def auth_logout():
+    session.clear()
+    return redirect('/')
+
+@app.route('/api/auth/status')
+def auth_status():
+    user = get_current_user()
+    if user:
+        return jsonify({
+            'success': True,
+            'logged_in': True,
+            'user': user.to_dict()
+        })
+    return jsonify({
+        'success': True,
+        'logged_in': False,
+        'user': None
+    })
 
 @app.route('/api/domains', methods=['GET'])
 def get_domains():
@@ -63,6 +213,8 @@ def get_domains():
 @app.route('/api/email/create/random', methods=['POST'])
 def create_random_email():
     try:
+        user = get_current_user()
+        
         random_length = random.randint(10, 15)
         payload = {
             "min_name_length": random_length,
@@ -85,13 +237,16 @@ def create_random_email():
             if existing:
                 existing.token = token
                 existing.is_active = True
+                if user:
+                    existing.user_id = user.id
                 db.session.commit()
                 return jsonify({'success': True, 'email': existing.to_dict()})
             
             new_email = TempEmail(
                 email=email_address,
                 token=token,
-                digit=str(random_length)
+                digit=str(random_length),
+                user_id=user.id if user else None
             )
             db.session.add(new_email)
             db.session.commit()
@@ -105,6 +260,7 @@ def create_random_email():
 @app.route('/api/email/create/custom', methods=['POST'])
 def create_custom_email():
     try:
+        user = get_current_user()
         data = request.get_json()
         name = data.get('name', '').strip()
         domain = data.get('domain', '').strip()
@@ -133,13 +289,16 @@ def create_custom_email():
             if existing:
                 existing.token = token
                 existing.is_active = True
+                if user:
+                    existing.user_id = user.id
                 db.session.commit()
                 return jsonify({'success': True, 'email': existing.to_dict()})
             
             new_email = TempEmail(
                 email=email_address,
                 token=token,
-                digit=str(len(name))
+                digit=str(len(name)),
+                user_id=user.id if user else None
             )
             db.session.add(new_email)
             db.session.commit()
@@ -153,9 +312,13 @@ def create_custom_email():
 @app.route('/api/email/<int:email_id>/inbox', methods=['GET'])
 def check_inbox(email_id):
     try:
+        user = get_current_user()
         email_account = TempEmail.query.get(email_id)
         if not email_account:
             return jsonify({'success': False, 'error': 'Email not found'})
+        
+        if not check_email_ownership(email_account, user):
+            return jsonify({'success': False, 'error': 'Akses ditolak'}), 403
         
         response = requests.get(
             f"https://api.internal.temp-mail.io/api/v3/email/{email_account.email}/messages",
@@ -210,7 +373,11 @@ def check_inbox(email_id):
 @app.route('/api/emails', methods=['GET'])
 def get_all_emails():
     try:
-        emails = TempEmail.query.order_by(TempEmail.created_at.desc()).all()
+        user = get_current_user()
+        if user:
+            emails = TempEmail.query.filter_by(user_id=user.id).order_by(TempEmail.created_at.desc()).all()
+        else:
+            emails = TempEmail.query.filter_by(user_id=None).order_by(TempEmail.created_at.desc()).all()
         return jsonify({
             'success': True,
             'emails': [e.to_dict() for e in emails]
@@ -221,9 +388,14 @@ def get_all_emails():
 @app.route('/api/email/<int:email_id>', methods=['GET'])
 def get_email(email_id):
     try:
+        user = get_current_user()
         email = TempEmail.query.get(email_id)
         if not email:
             return jsonify({'success': False, 'error': 'Email not found'})
+        
+        if not check_email_ownership(email, user):
+            return jsonify({'success': False, 'error': 'Akses ditolak'}), 403
+        
         return jsonify({'success': True, 'email': email.to_dict()})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
@@ -231,9 +403,13 @@ def get_email(email_id):
 @app.route('/api/email/<int:email_id>', methods=['DELETE'])
 def delete_email(email_id):
     try:
+        user = get_current_user()
         email = TempEmail.query.get(email_id)
         if not email:
             return jsonify({'success': False, 'error': 'Email not found'})
+        
+        if not check_email_ownership(email, user):
+            return jsonify({'success': False, 'error': 'Akses ditolak'}), 403
         
         db.session.delete(email)
         db.session.commit()
@@ -245,9 +421,13 @@ def delete_email(email_id):
 @app.route('/api/email/<int:email_id>/activate', methods=['POST'])
 def activate_email(email_id):
     try:
+        user = get_current_user()
         email_account = TempEmail.query.get(email_id)
         if not email_account:
             return jsonify({'success': False, 'error': 'Email not found'})
+        
+        if not check_email_ownership(email_account, user):
+            return jsonify({'success': False, 'error': 'Akses ditolak'}), 403
         
         name = email_account.email.split('@')[0]
         domain = email_account.email.split('@')[1]
@@ -279,9 +459,15 @@ def activate_email(email_id):
 @app.route('/api/message/<int:message_id>', methods=['GET'])
 def get_message(message_id):
     try:
+        user = get_current_user()
         message = EmailMessage.query.get(message_id)
         if not message:
             return jsonify({'success': False, 'error': 'Message not found'})
+        
+        email_account = TempEmail.query.get(message.email_id)
+        if email_account and not check_email_ownership(email_account, user):
+            return jsonify({'success': False, 'error': 'Akses ditolak'}), 403
+        
         return jsonify({'success': True, 'message': message.to_dict()})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
