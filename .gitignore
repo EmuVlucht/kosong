@@ -8,3 +8,30 @@ wheels/
 
 # Virtual environments
 .venv
+.pythonlibs/
+
+# Environment and secrets
+.env
+.env.local
+*.env
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Cache
+.cache/
+*.pyc
+
+# Logs
+*.log
+
+# Local files
+uv.lock
