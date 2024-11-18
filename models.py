@@ -3,10 +3,36 @@ from datetime import datetime
 
 db = SQLAlchemy()
 
+class User(db.Model):
+    __tablename__ = 'users'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    google_id = db.Column(db.String(255), unique=True, nullable=False)
+    email = db.Column(db.String(255), unique=True, nullable=False)
+    name = db.Column(db.String(255))
+    picture = db.Column(db.String(500))
+    access_token = db.Column(db.Text)
+    refresh_token = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_login = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    temp_emails = db.relationship('TempEmail', backref='owner', lazy=True)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'email': self.email,
+            'name': self.name,
+            'picture': self.picture,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'last_login': self.last_login.isoformat() if self.last_login else None
+        }
+
 class TempEmail(db.Model):
     __tablename__ = 'temp_emails'
     
     id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     email = db.Column(db.String(255), unique=True, nullable=False)
     token = db.Column(db.String(255), nullable=False)
     digit = db.Column(db.String(10), nullable=False)
